@@ -1,4 +1,6 @@
 from __future__ import print_function
+
+import nltk
 import numpy as np
 import operator
 import pandas as pd
@@ -75,19 +77,15 @@ def generate_features(train_df, test_df):
         if isinstance(s, str) or isinstance(s, unicode):
             s = re.sub('[^A-Za-z0-9-./]', ' ', s.lower())
             s = fix_units(s)
-            return [STEMMER.stem(word) for word in word_tokenize(s.lower())]
+            return [STEMMER.stem(word.lower()) for word in word_tokenize(s)]
         else:
             return []
 
     df = pd.concat((train_df, test_df), axis=0, ignore_index=True)
     df['title_terms'] = df['product_title'].apply(str_stem)
-    df['title_terms_sorted'] = df['title_terms'].apply(sorted)
     df['query_terms'] = df['search_term'].apply(str_stem)
-    df['query_terms_sorted'] = df['query_terms'].apply(sorted)
     df['description_terms'] = df['product_description'].apply(str_stem)
-    df['description_terms_sorted'] = df['description_terms'].apply(sorted)
     df['brand_terms'] = df['brand'].apply(str_stem)
-    df['brand_terms_sorted'] = df['brand_terms'].apply(sorted)
     df['product_terms'] = df['title_terms'] + df['description_terms']
 
     df['query_length'] = df['query_terms'].str.len()
@@ -96,19 +94,16 @@ def generate_features(train_df, test_df):
     df['description_length'] = df['description_terms'].str.len()
     get_term_match_features(df, "query_terms", "product_terms", "product_contains")
     get_term_match_features(df, "query_terms", "title_terms", "title_contains")
-    get_term_match_features(df, "query_terms_sorted", "title_terms_sorted", "title_contains_sorted")
     df['title_contains_fuzzy'] = df[['product_title', 'query_terms']].apply(
         lambda df_row: 1.0 * len([term for term in df_row['query_terms'] if term in df_row['product_title']])
         if set(df_row['query_terms']) > 0 else 0, axis=1)
 
     get_term_match_features(df, "query_terms", "description_terms", "description_contains")
-    get_term_match_features(df, "query_terms_sorted", "description_terms_sorted", "description_contains_sorted")
     df['description_contains_fuzzy'] = df[['product_description', 'query_terms']].apply(
         lambda df_row: 1.0 * len([term for term in df_row['query_terms'] if term in df_row['product_description']])
         if set(df_row['query_terms']) > 0 else 0.0, axis=1)
 
     get_term_match_features(df, "query_terms", "brand_terms", "brand_contains")
-    get_term_match_features(df, "query_terms_sorted", "brand_terms_sorted", "brand_contains_sorted")
     return df[:len(train_df)], df[len(train_df):]
 
 
@@ -122,15 +117,14 @@ def get_features_data(df, id_column='id', label_column='relevance', exclude_colu
     return ids, labels, features, feature_names
 
 
-def train_model(labels, features, weights=None, verbose=True):
-    regressor = GradientBoostingRegressor(n_estimators=500, learning_rate=0.1, max_depth=5)
-    # grid_search = GridSearchCV(estimator=regressor, param_grid={#'n_estimators': range(50, 500, 50),
-    #                                                             'max_depth': (2, 3, 5),
-    #                                                             'learning_rate': (0.01, 0.1, 0.2, 0.5),},
-    #                            scoring='mean_squared_error', n_jobs=-1, cv=5)
-
-    model = regressor
-    model.fit(features, labels, sample_weight=weights)
+def train_model(labels, features, verbose=True):
+    regressor = GradientBoostingRegressor()
+    grid_search = GridSearchCV(estimator=regressor, param_grid={'n_estimators': (100, 250, 500, 1000),
+                                                                'max_depth': (3, 5, 6),
+                                                                'learning_rate': (0.01, 0.1),},
+                               scoring='mean_squared_error', n_jobs=-1, cv=5)
+    model = grid_search
+    model.fit(features, labels)
     if verbose:
         if hasattr(model, 'best_params_'):
             print("Best parameters found by grid search:")
