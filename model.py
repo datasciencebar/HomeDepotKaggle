@@ -51,9 +51,9 @@ def read_data(train_path, test_path, attributes_path, descriptions_path):
         return ". ".join([row['name'] + "\t" + row['value']
                           for _, row in val[['name', 'value']].iterrows()])
 
-    train_data = pd.read_csv(train_path, encoding="ISO-8859-1")[:100]
-    test_data = pd.read_csv(test_path, encoding="ISO-8859-1")[:1]
-    attributes_data = pd.read_csv(attributes_path, encoding="ISO-8859-1").dropna()[:100]
+    train_data = pd.read_csv(train_path, encoding="ISO-8859-1")
+    test_data = pd.read_csv(test_path, encoding="ISO-8859-1")
+    attributes_data = pd.read_csv(attributes_path, encoding="ISO-8859-1").dropna()
     brand_data = attributes_data[attributes_data['name'] == 'MFG Brand Name'][["product_uid", "value"]].rename(
         columns={"value": "brand"})
     attributes_data['attributes'] = " . " + attributes_data['name'] + " . " + attributes_data['value'] + " \n "
@@ -189,10 +189,12 @@ def get_features_data(train_df, test_df, id_column='id',
                                / np.linalg.norm(test_queries_features, axis=1)\
                                / np.linalg.norm(test_description_features, axis=1)
     # Reshape 1d arrays to row*1 matrix
-    query_title_cosine_train = np.reshape(query_title_cosine_train, (query_title_cosine_train.shape[0], 1))
-    query_title_cosine_test = np.reshape(query_title_cosine_test, (query_title_cosine_test.shape[0], 1))
-    query_description_cosine_train = np.reshape(query_description_cosine_train, (query_description_cosine_train.shape[0], 1))
-    query_description_cosine_test = np.reshape(query_description_cosine_test, (query_description_cosine_test.shape[0], 1))
+    query_title_cosine_train = np.reshape(np.nan_to_num(query_title_cosine_train), (query_title_cosine_train.shape[0], 1))
+    query_title_cosine_test = np.reshape(np.nan_to_num(query_title_cosine_test), (query_title_cosine_test.shape[0], 1))
+    query_description_cosine_train = np.reshape(np.nan_to_num(query_description_cosine_train),
+                                                (query_description_cosine_train.shape[0], 1))
+    query_description_cosine_test = np.reshape(np.nan_to_num(query_description_cosine_test),
+                                               (query_description_cosine_test.shape[0], 1))
 
 
     train_feature_names = np.concatenate((filtered_train_df.columns.values, title_tfidf_feature_names,
