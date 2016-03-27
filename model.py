@@ -4,17 +4,19 @@ import gc
 import numpy as np
 import operator
 import pandas as pd
+import dill
 import cPickle as pickle
 
 from math import sqrt
 from nltk.stem.porter import *
 from nltk.tokenize import word_tokenize
-from numpy.core.umath_tests import inner1d
-from sklearn.decomposition import TruncatedSVD
+from sklearn.base import TransformerMixin, BaseEstimator
+from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.grid_search import GridSearchCV
-from sklearn.pipeline import Pipeline
+from sklearn.linear_model import SGDRegressor
+from sklearn.pipeline import Pipeline, FeatureUnion
 
 from features import get_term_match_features
 
@@ -31,10 +33,51 @@ MODEL_PATH = BASE_PATH + "gbr_model.pickle"
 IDF_PATH = BASE_PATH + "idf.pickle"
 
 STEMMER = PorterStemmer()
-TSVD_DIM = 10
-_tfidf = TfidfVectorizer(ngram_range=(1, 1), stop_words='english', min_df=2)
-_tsvd = TruncatedSVD(n_components=TSVD_DIM, random_state=42)
-TFIDF_PIPELINE = Pipeline([('tfidf', _tfidf), ('tsvd', _tsvd), ])
+
+
+class KeepNumericFeaturesTransformer(BaseEstimator, TransformerMixin):
+    """
+    Removes non-numeric columns from pandas data frame and returns the corresponding numpy array.
+    """
+    def __init__(self, exclude_columns=None):
+        if exclude_columns is None:
+            exclude_columns = ['id', 'product_uid', 'relevance']
+        self.exclude_columns = exclude_columns
+
+    def fit(self, x, y=None):
+        return self
+
+    def transform(self, df):
+        return df.drop(self.exclude_columns, axis=1).select_dtypes(include=['number']).values
+
+
+class ColumnSelector(BaseEstimator, TransformerMixin):
+    """
+    Keeps only the given list of columns in a data frame.
+    """
+    def __init__(self, columns):
+        self.columns = columns
+
+    def fit(self, x, y=None):
+        return self
+
+    def transform(self, df):
+        return df[self.columns]
+
+
+class ColumnTransformer(BaseEstimator, TransformerMixin):
+    """
+    Applies the given function to the given list of columns in a data frame.
+    """
+    def __init__(self, columns, func):
+        self.columns = columns
+        self.func = func
+
+    def fit(self, x, y=None):
+        return self
+
+    def transform(self, df):
+        return df[self.columns].apply(self.func)
 
 
 def read_data(train_path, test_path, attributes_path, descriptions_path):
@@ -126,116 +169,87 @@ def generate_features(train_df, test_df):
     df['title_length'] = df['title_terms'].str.len()
     df['brand_length'] = df['brand_terms'].str.len()
     df['description_length'] = df['description_terms'].str.len()
+
     df = get_term_match_features(df, "query_terms", "product_terms", "product_contains")
     df = get_term_match_features(df, "query_terms", "title_terms", "title_contains")
-    df['title_contains_fuzzy'] = df[['product_title', 'query_terms']].apply(
-        lambda df_row: 1.0 * len([term for term in df_row['query_terms'] if term in df_row['product_title']])
-        if set(df_row['query_terms']) > 0 else 0, axis=1)
-
     df = get_term_match_features(df, "query_terms", "description_terms", "description_contains")
-    df['description_contains_fuzzy'] = df[['product_description', 'query_terms']].apply(
-        lambda df_row: 1.0 * len([term for term in df_row['query_terms'] if term in df_row['product_description']])
-        if set(df_row['query_terms']) > 0 else 0.0, axis=1)
-
     df = get_term_match_features(df, "query_terms", "brand_terms", "brand_contains")
     df = get_term_match_features(df, "query_terms", "attributes_terms", "attributes_contains")
+
+    # Drop raw text columns.
+    df.drop(['product_title', 'search_term', 'product_description', 'attributes'], axis=1, inplace=True)
+
     return df[:len(train_df)], df[len(train_df):]
 
 
-def get_features_data(train_df, test_df, id_column='id',
-                      label_column='relevance', exclude_columns=['id', 'product_uid', 'relevance']):
-    test_ids = test_df[id_column].values
-    train_labels = train_df[label_column].values
-
-    filtered_train_df = train_df.drop(exclude_columns, axis=1)
-    filtered_train_df = filtered_train_df.select_dtypes(include=['number'])
-    filtered_test_df = test_df.drop(exclude_columns, axis=1)
-    filtered_test_df = filtered_test_df.select_dtypes(include=['number'])
-
-    train_document_titles = train_df['title_terms'].apply(lambda val: ' '.join(val)).values
-    test_document_titles = test_df['title_terms'].apply(lambda val: ' '.join(val)).values
-    train_doc_titles_features = TFIDF_PIPELINE.fit_transform(train_document_titles, train_labels)
-    test_doc_titles_features = TFIDF_PIPELINE.transform(test_document_titles)
-    title_tfidf_feature_names = ["title_tfidf_" + str(i) for i in xrange(TSVD_DIM)]
-
-    train_queries = train_df['query_terms'].apply(lambda val: ' '.join(val)).values
-    test_queries = test_df['query_terms'].apply(lambda val: ' '.join(val)).values
-    train_queries_features = TFIDF_PIPELINE.fit_transform(train_queries, train_labels)
-    test_queries_features = TFIDF_PIPELINE.transform(test_queries)
-    query_tfidf_feature_names = ["query_tfidf_" + str(i) for i in xrange(TSVD_DIM)]
-
-    train_description = train_df['description_terms'].apply(lambda val: ' '.join(val)).values
-    test_description = test_df['description_terms'].apply(lambda val: ' '.join(val)).values
-    train_description_features = TFIDF_PIPELINE.fit_transform(train_description, train_labels)
-    test_description_features = TFIDF_PIPELINE.transform(test_description)
-    description_tfidf_feature_names = ["description_tfidf_" + str(i) for i in xrange(TSVD_DIM)]
-
-    train_attributes = train_df['attributes_terms'].apply(lambda val: ' '.join(val)).values
-    test_attributes = test_df['attributes_terms'].apply(lambda val: ' '.join(val)).values
-    train_attributes_features = TFIDF_PIPELINE.fit_transform(train_attributes, train_labels)
-    test_attributes_features = TFIDF_PIPELINE.transform(test_attributes)
-    attributes_tfidf_feature_names = ["attributes_tfidf_" + str(i) for i in xrange(TSVD_DIM)]
-
-    query_title_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_doc_titles_features)\
-                               / np.linalg.norm(train_queries_features, axis=1)\
-                               / np.linalg.norm(train_doc_titles_features, axis=1)
-    query_title_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_doc_titles_features)\
-                               / np.linalg.norm(test_queries_features, axis=1)\
-                               / np.linalg.norm(test_doc_titles_features, axis=1)
-    query_description_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_description_features)\
-                               / np.linalg.norm(train_queries_features, axis=1)\
-                               / np.linalg.norm(train_description_features, axis=1)
-    query_description_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_description_features)\
-                               / np.linalg.norm(test_queries_features, axis=1)\
-                               / np.linalg.norm(test_description_features, axis=1)
-    # Reshape 1d arrays to row*1 matrix
-    query_title_cosine_train = np.reshape(np.nan_to_num(query_title_cosine_train), (query_title_cosine_train.shape[0], 1))
-    query_title_cosine_test = np.reshape(np.nan_to_num(query_title_cosine_test), (query_title_cosine_test.shape[0], 1))
-    query_description_cosine_train = np.reshape(np.nan_to_num(query_description_cosine_train),
-                                                (query_description_cosine_train.shape[0], 1))
-    query_description_cosine_test = np.reshape(np.nan_to_num(query_description_cosine_test),
-                                               (query_description_cosine_test.shape[0], 1))
-
-
-    train_feature_names = np.concatenate((filtered_train_df.columns.values, title_tfidf_feature_names,
-                                          query_tfidf_feature_names, description_tfidf_feature_names,
-                                          attributes_tfidf_feature_names,
-                                          ["query_title_tsvd_cosine", "query_description_tsvd_cosine"]))
-    test_feature_names = np.concatenate((filtered_test_df.columns.values, title_tfidf_feature_names,
-                                         query_tfidf_feature_names,
-                                         description_tfidf_feature_names,
-                                         attributes_tfidf_feature_names,
-                                         ["query_title_tsvd_cosine", "query_description_tsvd_cosine"]))
-    assert np.array_equal(train_feature_names, test_feature_names)
-
-    train_features = np.concatenate((filtered_train_df.values, train_doc_titles_features, train_queries_features, 
-                                     train_description_features, train_attributes_features, query_title_cosine_train,
-                                     query_description_cosine_train), axis=1)
-    test_features = np.concatenate((filtered_test_df.values, test_doc_titles_features, test_queries_features,
-                                    test_description_features, test_attributes_features, query_title_cosine_test,
-                                    query_description_cosine_test), axis=1)
-    return train_labels, train_features, train_feature_names, test_features, test_ids
+# def get_features_data(train_df, test_df, id_column='id',
+#                       label_column='relevance', exclude_columns=['id', 'product_uid', 'relevance']):
+#     test_ids = test_df[id_column].values
+#     train_labels = train_df[label_column].values
+#
+#
+#     query_title_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_doc_titles_features)\
+#                                / np.linalg.norm(train_queries_features, axis=1)\
+#                                / np.linalg.norm(train_doc_titles_features, axis=1)
+#     query_title_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_doc_titles_features)\
+#                                / np.linalg.norm(test_queries_features, axis=1)\
+#                                / np.linalg.norm(test_doc_titles_features, axis=1)
+#     query_description_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_description_features)\
+#                                / np.linalg.norm(train_queries_features, axis=1)\
+#                                / np.linalg.norm(train_description_features, axis=1)
+#     query_description_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_description_features)\
+#                                / np.linalg.norm(test_queries_features, axis=1)\
+#                                / np.linalg.norm(test_description_features, axis=1)
+#
+#     return train_labels, train_features, train_feature_names, test_features, test_ids
 
 
 def train_model(labels, features, verbose=True):
-    regressor = GradientBoostingRegressor()
-    grid_search = GridSearchCV(estimator=regressor, param_grid={'n_estimators': (500, ),
-                                                                'max_depth': (5, ),
-                                                                'subsample': (0.8, ),
-                                                                'learning_rate': (0.1, ), },
+    regressor = GradientBoostingRegressor(n_estimators=500, max_depth=5, subsample=0.8, learning_rate=0.1)
+    identity = lambda x: x
+    model_pipeline = Pipeline([
+        ('features', FeatureUnion([
+            ('qtopic', Pipeline([
+                ('get_terms', ColumnSelector('query_terms')),
+                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                ('topic', LatentDirichletAllocation(n_topics=10))
+            ])),
+            ('ttopic', Pipeline([
+                ('get_terms', ColumnSelector('title_terms')),
+                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                ('topic', LatentDirichletAllocation(n_topics=10))
+            ])),
+            ('dtopic', Pipeline([
+                ('get_terms', ColumnSelector('description_terms')),
+                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                ('topic', LatentDirichletAllocation(n_topics=10))
+            ])),
+            ('atopic', Pipeline([
+                ('get_terms', ColumnSelector('description_terms')),
+                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                ('topic', LatentDirichletAllocation(n_topics=10))
+            ])),
+            ('match', KeepNumericFeaturesTransformer())
+        ])),
+        ('regr', regressor)
+    ])
+
+    grid_search = GridSearchCV(estimator=model_pipeline, param_grid={'regr__n_estimators': (500, ),
+                                                                'regr__max_depth': (5, ),
+                                                                'regr__subsample': (0.8, ),
+                                                                'regr__learning_rate': (0.1, ), },
                                scoring='mean_squared_error', n_jobs=-1, cv=5, verbose=5)
-    model = grid_search
-    model.fit(features, labels)
+
+    grid_search.fit(features, labels)
     if verbose:
-        if hasattr(model, 'best_params_'):
+        if hasattr(grid_search, 'best_params_'):
             print("Best parameters found by grid search:")
-            print(model.best_params_)
-            print("Best CV RMSE = ", sqrt(-model.best_score_))
-            regressor = model.best_estimator_
-        train_score = regressor.score(features, labels)
+            print(grid_search.best_params_)
+            print("Best CV RMSE = ", sqrt(-grid_search.best_score_))
+        train_score = grid_search.best_estimator_.score(features, labels)
         print("Training RMSE = ", train_score)
 
-    return regressor
+    return grid_search
 
 
 def predict(model, test_ids, test_features, output_path):
@@ -257,16 +271,16 @@ def prepare_data():
     train_df, test_df = read_data(TRAIN_PATH, TEST_PATH, ATTRIBUTES_PATH, DESCRIPTIONS_PATH)
     train_df, test_df = generate_features(train_df, test_df)
     # compute_idf(pd.concat((train_df, test_df), axis=0, ignore_index=True))
-    train_labels, train_features, train_feature_names, test_features, test_ids = get_features_data(train_df, test_df)
-    train_df = None
-    test_df = None
-    gc.collect()
 
-    model = train_model(train_labels, train_features)
-    predict(model, test_ids, test_features, OUTPUT_PATH)
+    test_ids = test_df['id'].values
+    train_labels = train_df['relevance'].values
+
+    gc.collect()
+    model = train_model(train_labels, train_df)
+    predict(model, test_ids, test_df, OUTPUT_PATH)
     with open(MODEL_PATH, 'w') as out:
-        pickle.dump(model, out)
-    analyze_model(model, train_feature_names)
+        dill.dump(model, out)
+    # analyze_model(model, train_feature_names)
 
 
 def compute_idf(df):
