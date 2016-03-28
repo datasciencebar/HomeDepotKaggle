@@ -11,7 +11,7 @@ from math import sqrt
 from nltk.stem.porter import *
 from nltk.tokenize import word_tokenize
 from sklearn.base import TransformerMixin, BaseEstimator
-from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.decomposition import LatentDirichletAllocation, TruncatedSVD
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.grid_search import GridSearchCV
@@ -78,6 +78,33 @@ class ColumnTransformer(BaseEstimator, TransformerMixin):
 
     def transform(self, df):
         return df[self.columns].apply(self.func)
+
+
+class CosineSimilarityTransformer(BaseEstimator, TransformerMixin):
+    """
+    Compute cosine similarity between vectors stored inside the features matrix.
+    """
+    def __init__(self, query_vector_range, doc_vectors_ranges):
+        self.query_vector_range = query_vector_range
+        self.doc_vectors_ranges = doc_vectors_ranges
+
+    def fit(self, x, y=None):
+        return self
+
+    def transform(self, features):
+        query_vector = features[:,self.query_vector_range[0]:self.query_vector_range[1]]
+        doc_vectors = []
+        for rng in self.doc_vectors_ranges:
+            doc_vectors.append(features[:, rng[0]:rng[1]])
+        res = [features, ]
+        for doc_vector in doc_vectors:
+            res.append(self._compute_cosine(query_vector, doc_vector))
+        return np.hstack(res)
+
+    def _compute_cosine(self, vec_1, vec_2):
+        res = np.einsum('ij, ij->i', vec_1, vec_2) / np.linalg.norm(vec_1, axis=1) / np.linalg.norm(vec_2, axis=1)
+        return np.reshape(np.nan_to_num(res), (res.shape[0], 1))
+
 
 
 def read_data(train_path, test_path, attributes_path, descriptions_path):
@@ -182,52 +209,41 @@ def generate_features(train_df, test_df):
     return df[:len(train_df)], df[len(train_df):]
 
 
-# def get_features_data(train_df, test_df, id_column='id',
-#                       label_column='relevance', exclude_columns=['id', 'product_uid', 'relevance']):
-#     test_ids = test_df[id_column].values
-#     train_labels = train_df[label_column].values
-#
-#
-#     query_title_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_doc_titles_features)\
-#                                / np.linalg.norm(train_queries_features, axis=1)\
-#                                / np.linalg.norm(train_doc_titles_features, axis=1)
-#     query_title_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_doc_titles_features)\
-#                                / np.linalg.norm(test_queries_features, axis=1)\
-#                                / np.linalg.norm(test_doc_titles_features, axis=1)
-#     query_description_cosine_train = np.einsum('ij, ij->i', train_queries_features, train_description_features)\
-#                                / np.linalg.norm(train_queries_features, axis=1)\
-#                                / np.linalg.norm(train_description_features, axis=1)
-#     query_description_cosine_test = np.einsum('ij, ij->i', test_queries_features, test_description_features)\
-#                                / np.linalg.norm(test_queries_features, axis=1)\
-#                                / np.linalg.norm(test_description_features, axis=1)
-#
-#     return train_labels, train_features, train_feature_names, test_features, test_ids
-
-
 def train_model(labels, features, verbose=True):
     regressor = GradientBoostingRegressor(n_estimators=500, max_depth=5, subsample=0.8, learning_rate=0.1)
     identity = lambda x: x
+
+    tsvd_dimension = 10
+
     model_pipeline = Pipeline([
         ('features', FeatureUnion([
-            ('qtopic', Pipeline([
-                ('get_terms', ColumnSelector('query_terms')),
-                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
-                ('topic', LatentDirichletAllocation(n_topics=10))
-            ])),
-            ('ttopic', Pipeline([
-                ('get_terms', ColumnSelector('title_terms')),
-                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
-                ('topic', LatentDirichletAllocation(n_topics=10))
-            ])),
-            ('dtopic', Pipeline([
-                ('get_terms', ColumnSelector('description_terms')),
-                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
-                ('topic', LatentDirichletAllocation(n_topics=10))
-            ])),
-            ('atopic', Pipeline([
-                ('get_terms', ColumnSelector('description_terms')),
-                ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
-                ('topic', LatentDirichletAllocation(n_topics=10))
+            ('topic', Pipeline([
+                ('comp_topics', FeatureUnion([
+                    ('qtopic', Pipeline([
+                        ('get_terms', ColumnSelector('query_terms')),
+                        ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                        ('topic', TruncatedSVD(n_components=tsvd_dimension))
+                    ])),
+                    ('ttopic', Pipeline([
+                        ('get_terms', ColumnSelector('title_terms')),
+                        ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                        ('topic', TruncatedSVD(n_components=tsvd_dimension))
+                    ])),
+                    ('dtopic', Pipeline([
+                        ('get_terms', ColumnSelector('description_terms')),
+                        ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                        ('topic', TruncatedSVD(n_components=tsvd_dimension))
+                    ])),
+                    ('atopic', Pipeline([
+                        ('get_terms', ColumnSelector('description_terms')),
+                        ('tfidf', TfidfVectorizer(preprocessor=identity, tokenizer=identity, stop_words='english', min_df=1)),
+                        ('topic', TruncatedSVD(n_components=tsvd_dimension))
+                    ]))
+                ])),
+                ('cosine', CosineSimilarityTransformer((0, tsvd_dimension), [(beg, beg + tsvd_dimension)
+                                                                             for beg in xrange(tsvd_dimension,
+                                                                                               3 * tsvd_dimension,
+                                                                                               tsvd_dimension)]))
             ])),
             ('match', KeepNumericFeaturesTransformer())
         ])),
@@ -238,7 +254,7 @@ def train_model(labels, features, verbose=True):
                                                                 'regr__max_depth': (5, ),
                                                                 'regr__subsample': (0.8, ),
                                                                 'regr__learning_rate': (0.1, ), },
-                               scoring='mean_squared_error', n_jobs=-1, cv=5, verbose=5)
+                               scoring='mean_squared_error', n_jobs=1, cv=5, verbose=5)
 
     grid_search.fit(features, labels)
     if verbose:
@@ -259,8 +275,11 @@ def predict(model, test_ids, test_features, output_path):
     pd.DataFrame({"id": test_ids, "relevance": y_pred}).to_csv(output_path, index=False)
 
 
-def analyze_model(model, features):
+def analyze_model(model, features=None):
+    model = model.best_estimator_.named_steps['regr']
     if hasattr(model, 'feature_importances_'):
+        if features is None:
+            features = [str(i) for i in xrange(len(model.feature_importances_))]
         feature_scores = zip(features, model.feature_importances_)
         feature_scores.sort(key=operator.itemgetter(1), reverse=True)
         print("Feature importances:")
@@ -280,7 +299,7 @@ def prepare_data():
     predict(model, test_ids, test_df, OUTPUT_PATH)
     with open(MODEL_PATH, 'w') as out:
         dill.dump(model, out)
-    # analyze_model(model, train_feature_names)
+    analyze_model(model)
 
 
 def compute_idf(df):
